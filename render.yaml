@@ -9,6 +9,6 @@ services:
       - key: GROQ_API_KEY
         sync: false   # set this in Render dashboard
       - key: LLM_MODEL
-        value: llama3-8b-8192
+        value: llama-3.1-8b-instant
       - key: CORS_ORIGINS
         value: "*"

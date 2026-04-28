@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     # Groq (free LLM)
     groq_api_key: str = ""
-    llm_model: str = "llama3-8b-8192"   # free Groq model
+    llm_model: str = "llama-3.1-8b-instant"   # free Groq model
 
     # Embeddings — sentence-transformers runs on CPU, no API key needed
     embedding_model: str = "all-MiniLM-L6-v2"
