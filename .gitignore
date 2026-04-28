@@ -18,3 +18,4 @@ backend/data/chroma_db/
 .DS_Store
 .idea/
 .vscode/
+.claude/

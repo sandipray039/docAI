@@ -7,7 +7,17 @@ import requests
 import streamlit as st
 
 
-API_URL = os.getenv("API_URL", "http://localhost:8000/api")
+def _get_api_url() -> str:
+    # Streamlit Cloud → st.secrets; local → env var; fallback → localhost
+    try:
+        if "API_URL" in st.secrets:
+            return str(st.secrets["API_URL"])
+    except Exception:
+        pass
+    return os.getenv("API_URL", "http://localhost:8000/api")
+
+
+API_URL = _get_api_url()
 TIMEOUT = int(os.getenv("API_TIMEOUT", "300"))
 
 

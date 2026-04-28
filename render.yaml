@@ -2,14 +2,13 @@ services:
   - type: web
     name: docai-backend
     runtime: python
+    rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GROQ_API_KEY
         sync: false   # set this in Render dashboard
+      - key: LLM_MODEL
+        value: llama3-8b-8192
       - key: CORS_ORIGINS
         value: "*"
-    disk:
-      name: docai-data
-      mountPath: /app/data
-      sizeGB: 1

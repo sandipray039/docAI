@@ -1,134 +1,112 @@
 """
-Vector Service: Embed chunks via sentence-transformers (CPU) and store/query in ChromaDB.
+Document store + retrieval service.
+
+Uses BM25 (keyword-based ranking) for retrieval — no embedding model
+required, no internet, no GPU. Documents are persisted as JSON to disk.
 """
 
+import json
+import re
+import threading
 import uuid
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 
-from app.config import (
-    CHROMA_DIR,
-    COLLECTION_NAME,
-    EMBEDDING_MODEL,
-    TOP_K,
-)
-
-# Model is loaded once at import time; first call downloads it (~90 MB) automatically.
-_encoder: Optional[SentenceTransformer] = None
+from app.config import CHROMA_DIR, TOP_K
 
 
-def _get_encoder() -> SentenceTransformer:
-    global _encoder
-    if _encoder is None:
-        _encoder = SentenceTransformer(EMBEDDING_MODEL)
-    return _encoder
+_STORE_FILE = CHROMA_DIR / "store.json"
+_lock = threading.Lock()
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
-_chroma_client = chromadb.PersistentClient(
-    path=str(CHROMA_DIR),
-    settings=ChromaSettings(anonymized_telemetry=False),
-)
+def _tokenize(text: str) -> List[str]:
+    return [t.lower() for t in _TOKEN_RE.findall(text or "")]
 
 
-def _get_collection():
-    return _chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+def _load() -> List[Dict]:
+    if not _STORE_FILE.exists():
+        return []
+    try:
+        return json.loads(_STORE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
 
-def embed_text(text: str) -> List[float]:
-    return _get_encoder().encode(text, normalize_embeddings=True).tolist()
-
-
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    return _get_encoder().encode(texts, normalize_embeddings=True).tolist()
+def _save(items: List[Dict]) -> None:
+    _STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _STORE_FILE.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
 
 
 def add_chunks(chunks: List[Dict]) -> int:
-    """
-    Add chunks to the vector store.
-    Each chunk: {"text": str, "metadata": {"source": str, "page": int, "chunk_index": int}}
-    """
+    """Persist chunks. Each: {"text": str, "metadata": {"source","page","chunk_index"}}"""
     if not chunks:
         return 0
-
-    collection = _get_collection()
-    texts = [c["text"] for c in chunks]
-    metadatas = [c["metadata"] for c in chunks]
-    ids = [
-        f"{c['metadata'].get('source','doc')}-p{c['metadata'].get('page',0)}-c{c['metadata'].get('chunk_index',0)}-{uuid.uuid4().hex[:8]}"
-        for c in chunks
-    ]
-    embeddings = embed_texts(texts)
-
-    collection.add(
-        ids=ids,
-        documents=texts,
-        metadatas=metadatas,
-        embeddings=embeddings,
-    )
+    with _lock:
+        items = _load()
+        for c in chunks:
+            items.append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "text": c["text"],
+                    "metadata": c.get("metadata", {}),
+                }
+            )
+        _save(items)
     return len(chunks)
 
 
 def query(question: str, top_k: int = TOP_K, source_filter: Optional[str] = None) -> List[Dict]:
-    """Retrieve top-k relevant chunks for a question."""
-    collection = _get_collection()
-    if collection.count() == 0:
+    """Retrieve top-k relevant chunks via BM25."""
+    items = _load()
+    if source_filter:
+        items = [it for it in items if it.get("metadata", {}).get("source") == source_filter]
+    if not items:
         return []
 
-    q_emb = embed_text(question)
-    where = {"source": source_filter} if source_filter else None
+    corpus = [_tokenize(it["text"]) for it in items]
+    bm25 = BM25Okapi(corpus)
 
-    res = collection.query(
-        query_embeddings=[q_emb],
-        n_results=min(top_k, collection.count()),
-        where=where,
-    )
+    q_tokens = _tokenize(question)
+    if not q_tokens:
+        return []
 
-    out: List[Dict] = []
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
-    dists = (res.get("distances") or [[]])[0]
-    for doc, meta, dist in zip(docs, metas, dists):
-        out.append({"text": doc, "metadata": meta or {}, "distance": float(dist)})
-    return out
+    scores = bm25.get_scores(q_tokens)
+    indices = sorted(range(len(items)), key=lambda i: scores[i], reverse=True)[:top_k]
+
+    return [
+        {
+            "text": items[i]["text"],
+            "metadata": items[i].get("metadata", {}),
+            "distance": float(-scores[i]),
+        }
+        for i in indices
+        if scores[i] > 0
+    ]
 
 
 def list_documents() -> List[Dict]:
-    """Return distinct sources currently indexed with chunk counts."""
-    collection = _get_collection()
-    if collection.count() == 0:
-        return []
-
-    res = collection.get(include=["metadatas"])
+    items = _load()
     counts: Dict[str, int] = {}
-    for meta in res.get("metadatas") or []:
-        if not meta:
-            continue
-        src = meta.get("source", "unknown")
+    for it in items:
+        src = it.get("metadata", {}).get("source", "unknown")
         counts[src] = counts.get(src, 0) + 1
     return [{"source": s, "chunks": n} for s, n in sorted(counts.items())]
 
 
 def delete_document(source: str) -> int:
-    """Delete all chunks for a given source. Returns number removed."""
-    collection = _get_collection()
-    res = collection.get(where={"source": source})
-    ids = res.get("ids") or []
-    if not ids:
-        return 0
-    collection.delete(ids=ids)
-    return len(ids)
+    with _lock:
+        items = _load()
+        before = len(items)
+        items = [it for it in items if it.get("metadata", {}).get("source") != source]
+        removed = before - len(items)
+        if removed:
+            _save(items)
+    return removed
 
 
 def reset_collection() -> None:
-    """Drop and recreate the collection."""
-    try:
-        _chroma_client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    _get_collection()
+    with _lock:
+        _save([])
